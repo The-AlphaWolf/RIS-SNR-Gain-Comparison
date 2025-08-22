@@ -1,0 +1,118 @@
+clear; clc;
+%% System Parameters
+fc = 28e9;
+c = physconst('Lightspeed');
+lambda = c / fc;
+fs = 10e6;
+numSymbols = 1000;
+rng(2023);
+
+%% Channel/pathloss parameters -- from paper
+beta0_dB = -20;            % Reference pathloss β0^2 at d0=1m in dB
+beta0 = 10^(beta0_dB/10);  % Linear scale
+d0 = 1;
+alphaG = 2.2;              % Path loss exponent BS-RIS and RIS-target
+alphaH1 = 2.8;             % Path loss exponent BS-UE
+alphaH2 = 2.8;             % Path loss exponent RIS-UE
+
+K_dB = 10;   % Rician K-factor for BS-RIS
+K = 10^(K_dB / 10);
+kappa = sqrt(K/(K+1));
+
+%% Arrays and geometry
+Nr = 20; Nc = 20;                          % RIS: m x n (mn elements)
+dr = 0.5*lambda; dc = 0.5*lambda;           % Half-wavelength spacing
+numRIS = Nr*Nc;
+M = 4; % #BS antennas (as in common examples)
+bsPos = [0; 0; 30];                         % BS at (0,0,30)
+RIS_x_vals = 50:100:950;
+
+% User positions: 1000m from BS, heights 2, 12, 22m
+numUE = 3;
+pos_ue = [1000*ones(1,numUE); zeros(1,numUE); [2 12 22]];
+
+results_LOS_RIS_SNRs = zeros(length(RIS_x_vals), numUE);
+
+% Steering vector (ULA, as in eqn (3) in the paper)
+steering_vec = @(theta, M) exp(-1j*pi*(0:M-1).' * sin(theta));
+
+for idx = 1:length(RIS_x_vals)
+    %% Place RIS at this x, elements spread in y and z
+    pos_ris = [RIS_x_vals(idx); 0; 15];
+    rowIndices = (-(Nr-1)/2:(Nr-1)/2)*dr;
+    colIndices = (-(Nc-1)/2:(Nc-1)/2)*dc;
+    [Y, Z] = meshgrid(rowIndices, colIndices);
+    risElementPos = [pos_ris(1) * ones(1, numRIS); reshape(Y,1,[]); reshape(Z,1,[])];
+
+    % Channel arrays (per user)
+    H = zeros(numUE, M);
+    for k = 1:numUE
+        uePos = pos_ue(:,k);
+
+        %% h1: BS→UE (Rayleigh, with pathloss)
+        d_bs_ue = norm(bsPos - uePos);
+        beta_h1 = sqrt(beta0 * (d_bs_ue/d0)^(-alphaH1/2));
+        g1 = (randn(M,1) + 1j*randn(M,1))/sqrt(2);
+        h1 = beta_h1 * g1;
+
+        %% h2: RIS→UE (Rayleigh, with pathloss, N x 1)
+        d_ris_ue = sqrt(sum((risElementPos - uePos).^2,1));
+        beta_h2 = sqrt(beta0 * (d_ris_ue/d0).^(-alphaH2/2));
+        g2 = (randn(1,numRIS) + 1j*randn(1,numRIS))/sqrt(2); % 1 x N
+        h2 = beta_h2 .* g2; % 1 x N, row vector
+
+        %% G: BS→RIS (Rician MIMO, N x M)
+        d_bs_ris = sqrt(sum((risElementPos - bsPos).^2,1));
+        beta_G = sqrt(beta0 * (d_bs_ris/d0).^(-alphaG/2)); % 1 x N
+
+        G_LoS = (ones(numRIS,1)) * ones(1,M); % N x M, broadside steering for simplicity
+
+        G_NLoS = (randn(numRIS,M) + 1j*randn(numRIS,M))/sqrt(2); % N x M
+        G = diag(beta_G) * (kappa*G_LoS + sqrt(1-kappa^2)*G_NLoS);
+
+        %% RIS phases for this user (all 1, or can set for coherent sum/beamforming)
+        v = ones(numRIS,1);
+
+        %% Effective channel for user k: c = h2.' + diag(v) * G * h1   (N x 1) + (N x N)*(N x M)*(M x 1) -> (N x 1)
+        % Since v=ones, diag(v) is identity. h2 is 1xN, G is N x M, h1 Mx1
+        c = h2.' + G * h1;    % N x 1
+
+        % Equivalent composite effective channel: sum all reflected paths for single-antenna UE
+        H(k,:) = (sum(c)/sqrt(numRIS)) * ones(1,M); % Normalize sum to avoid RIS artificial gain
+    end
+
+    %% Zero-forcing precoding (multiuser): MxnumUE matrix
+    W = pinv(H);
+
+    %% Transmit power (fixed)
+    Ptx = 0.5;
+    data = 2*randi([0 1], numSymbols, numUE) - 1;
+    x_precoded = sqrt(Ptx) * data * W.';
+
+    %% Channel output and noise for each user
+    y = H * x_precoded.'; y = y.'; % (numSymbols x numUE)
+    noisePower = 0.001; % -30 dBW
+    noise = sqrt(noisePower/2) * (randn(size(y)) + 1j*randn(size(y)));
+    y_noisy = y + noise;
+
+    %% SNR calculation for each user
+    for k = 1:numUE
+        sig_p = bandpower(y(:,k));
+        noise_p = bandpower(noise(:,k));
+        SNR = 10*log10(sig_p / noise_p);
+        results_LOS_RIS_SNRs(idx,k) = SNR;
+        fprintf('RIS at x=%.0f m, UE%d (h=%.1f): SNR = %.2f dB\n', ...
+            RIS_x_vals(idx), k, pos_ue(3,k), SNR);
+    end
+end
+
+%% Plot
+figure;
+plot(RIS_x_vals, results_LOS_RIS_SNRs(:,1), '-o', 'DisplayName', 'UE1 (2m)', 'LineWidth',2);
+hold on;
+plot(RIS_x_vals, results_LOS_RIS_SNRs(:,2), '-s', 'DisplayName', 'UE2 (12m)', 'LineWidth',2);
+plot(RIS_x_vals, results_LOS_RIS_SNRs(:,3), '-d', 'DisplayName', 'UE3 (22m)', 'LineWidth',2);
+xlabel('RIS x-position (m)');
+ylabel('Combined SNR (dB)');
+title('Combined SNR vs. RIS x-position');
+legend show; grid on;
